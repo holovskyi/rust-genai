@@ -2,7 +2,7 @@ use crate::adapter::adapters::support::{StreamerCapturedData, StreamerOptions};
 use crate::adapter::anthropic::oauth_utils::{strip_tool_prefix, OAUTH_TOOL_PREFIX};
 use crate::adapter::anthropic::parse_cache_creation_details;
 use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
-use crate::chat::{ChatOptionsSet, PromptTokensDetails, ToolCall, Usage};
+use crate::chat::{ChatOptionsSet, CompletionTokensDetails, PromptTokensDetails, ToolCall, Usage};
 use crate::webc::{Event, EventSourceStream};
 use crate::{Error, ModelIden, Result};
 use serde_json::{Map, Value};
@@ -26,6 +26,8 @@ enum InProgressBlock {
 	Text,
 	ToolUse { id: String, name: String, input: String },
 	Thinking,
+	ServerToolUse,
+	WebSearchToolResult,
 }
 
 impl AnthropicStreamer {
@@ -88,6 +90,14 @@ impl futures::Stream for AnthropicStreamer {
 										input: String::new(),
 									};
 								}
+								Ok("server_tool_use") => {
+									// Server tool use (like web_search) - we don't need to accumulate input
+									self.in_progress_block = InProgressBlock::ServerToolUse;
+								}
+								Ok("web_search_tool_result") => {
+									// Web search results - content is delivered as a complete block
+									self.in_progress_block = InProgressBlock::WebSearchToolResult;
+								}
 								Ok(txt) => {
 									tracing::warn!("unhandled content type: {txt}");
 								}
@@ -145,6 +155,11 @@ impl futures::Stream for AnthropicStreamer {
 										);
 										continue;
 									}
+								}
+								InProgressBlock::ServerToolUse | InProgressBlock::WebSearchToolResult => {
+									// These block types don't have deltas in the same way text does
+									// The content is delivered as a complete block
+									continue;
 								}
 							}
 						}
@@ -305,6 +320,22 @@ impl AnthropicStreamer {
 						cached_tokens: Some(cache_read),
 						audio_tokens: None,
 					});
+				}
+			}
+
+			// -- Capture web_search_requests (present in message_delta)
+			if message_type == "message_delta" {
+				let web_search_requests = data
+					.get("usage")
+					.and_then(|u| u.get("server_tool_use"))
+					.and_then(|s| s.get("web_search_requests"))
+					.and_then(|v| v.as_i64())
+					.map(|v| v as i32);
+
+				if let Some(requests) = web_search_requests {
+					let usage = self.captured_data.usage.get_or_insert(Usage::default());
+					let details = usage.completion_tokens_details.get_or_insert(CompletionTokensDetails::default());
+					details.web_search_requests = Some(requests);
 				}
 			}
 		}
