@@ -555,10 +555,11 @@ impl GeminiAdapter {
 									"thoughtSignature": thought
 								}));
 							}
-							// Web search types are Anthropic-only response types; skip gracefully.
+							// Web search/fetch types are Anthropic-only response types; skip gracefully.
 							ContentPart::TextWithCitations(_) => {}
 							ContentPart::ServerToolUse(_) => {}
 							ContentPart::WebSearchToolResult(_) => {}
+							ContentPart::WebFetchToolResult(_) => {}
 						}
 					}
 
@@ -626,10 +627,11 @@ impl GeminiAdapter {
 									parts_values.push(json!({"thoughtSignature": thought}));
 								}
 							}
-							// Web search types are Anthropic-only response types; skip gracefully.
+							// Web search/fetch types are Anthropic-only response types; skip gracefully.
 							ContentPart::TextWithCitations(_) => {}
 							ContentPart::ServerToolUse(_) => {}
 							ContentPart::WebSearchToolResult(_) => {}
+							ContentPart::WebFetchToolResult(_) => {}
 						}
 					}
 					if let Some(thought) = pending_thought {
