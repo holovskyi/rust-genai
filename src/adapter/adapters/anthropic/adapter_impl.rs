@@ -62,6 +62,9 @@ const MAX_TOKENS_8K: u32 = 8192; // claude-3-5-sonnet, claude-3-5-haiku
 const MAX_TOKENS_4K: u32 = 4096; // claude-3-opus, claude-3-haiku
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+/// Beta flag required by Anthropic to honor 1-hour prompt-cache TTL.
+/// See: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching#1-hour-cache-duration
+const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 const MODELS: &[&str] = &["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"];
 
 impl AnthropicAdapter {
@@ -125,23 +128,40 @@ impl Adapter for AnthropicAdapter {
 			.as_ref()
 			.is_some_and(|tools| tools.iter().any(|t| t.name == "web_fetch"));
 
+		// -- Detect any Ephemeral1h cache_control to opt into the extended-cache-ttl beta.
+		// 5m and default Ephemeral are GA and do not require a beta header.
+		let has_1h_cache = chat_req.messages.iter().any(|m| {
+			matches!(
+				m.options.as_ref().and_then(|o| o.cache_control.as_ref()),
+				Some(CacheControl::Ephemeral1h)
+			)
+		});
+
 		// -- headers (different for OAuth vs API key)
 		let headers = if is_oauth {
 			// OAuth requires different headers:
 			// - Bearer token instead of x-api-key
 			// - Minimal beta flags to match what works with OAuth
+			let beta_header = if has_1h_cache {
+				format!("{},{}", OAUTH_ANTHROPIC_BETA, EXTENDED_CACHE_TTL_BETA)
+			} else {
+				OAUTH_ANTHROPIC_BETA.to_string()
+			};
 			Headers::from(vec![
 				("Authorization".to_string(), format!("Bearer {}", api_key)),
-				("anthropic-beta".to_string(), OAUTH_ANTHROPIC_BETA.to_string()),
+				("anthropic-beta".to_string(), beta_header),
 				("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
 			])
 		} else {
-			// Build beta header with optional web-fetch beta
-			let beta_header = if has_web_fetch {
-				"effort-2025-11-24,web-fetch-2025-09-10".to_string()
-			} else {
-				"effort-2025-11-24".to_string()
-			};
+			// Build comma-separated beta header with optional flags.
+			let mut beta_parts: Vec<&str> = vec!["effort-2025-11-24"];
+			if has_web_fetch {
+				beta_parts.push("web-fetch-2025-09-10");
+			}
+			if has_1h_cache {
+				beta_parts.push(EXTENDED_CACHE_TTL_BETA);
+			}
+			let beta_header = beta_parts.join(",");
 			Headers::from(vec![
 				("x-api-key".to_string(), api_key),
 				("anthropic-beta".to_string(), beta_header),
@@ -1144,6 +1164,131 @@ mod tests {
 		let result = parse_cache_creation_details(&cache_creation);
 		assert!(result.is_none());
 	}
+
+	// region: --- anthropic-beta header construction tests
+
+	use crate::adapter::AdapterKind;
+	use crate::chat::{ChatMessage, ChatRequest, Tool};
+	use crate::resolver::{AuthData, Endpoint};
+	use crate::{ModelIden, ServiceTarget};
+
+	fn build_target(api_key: &str) -> ServiceTarget {
+		ServiceTarget {
+			endpoint: Endpoint::from_static("https://api.anthropic.com/v1/"),
+			auth: AuthData::from_single(api_key),
+			model: ModelIden::new(AdapterKind::Anthropic, "claude-haiku-4-5"),
+		}
+	}
+
+	fn beta_header(req: &WebRequestData) -> String {
+		req.headers
+			.iter()
+			.find(|(k, _)| k.as_str() == "anthropic-beta")
+			.map(|(_, v)| v.clone())
+			.expect("anthropic-beta header must be set")
+	}
+
+	#[test]
+	fn test_beta_header_api_key_with_1h_cache() {
+		let chat_req = ChatRequest::new(vec![
+			ChatMessage::user("hello").with_options(CacheControl::Ephemeral1h),
+		]);
+		let req = AnthropicAdapter::to_web_request_data(
+			build_target("sk-ant-api-test"),
+			ServiceType::Chat,
+			chat_req,
+			ChatOptionsSet::default(),
+		)
+		.expect("request build");
+		let beta = beta_header(&req);
+		assert!(beta.contains("effort-2025-11-24"), "beta='{beta}'");
+		assert!(beta.contains("extended-cache-ttl-2025-04-11"), "beta='{beta}'");
+	}
+
+	#[test]
+	fn test_beta_header_api_key_without_1h_cache() {
+		let chat_req = ChatRequest::new(vec![ChatMessage::user("hello")]);
+		let req = AnthropicAdapter::to_web_request_data(
+			build_target("sk-ant-api-test"),
+			ServiceType::Chat,
+			chat_req,
+			ChatOptionsSet::default(),
+		)
+		.expect("request build");
+		let beta = beta_header(&req);
+		assert!(beta.contains("effort-2025-11-24"), "beta='{beta}'");
+		assert!(!beta.contains("extended-cache-ttl-2025-04-11"), "beta='{beta}'");
+	}
+
+	#[test]
+	fn test_beta_header_api_key_with_1h_cache_and_web_fetch() {
+		let chat_req = ChatRequest::new(vec![
+			ChatMessage::user("hello").with_options(CacheControl::Ephemeral1h),
+		])
+		.with_tools(vec![Tool::new("web_fetch")]);
+		let req = AnthropicAdapter::to_web_request_data(
+			build_target("sk-ant-api-test"),
+			ServiceType::Chat,
+			chat_req,
+			ChatOptionsSet::default(),
+		)
+		.expect("request build");
+		let beta = beta_header(&req);
+		assert!(beta.contains("effort-2025-11-24"), "beta='{beta}'");
+		assert!(beta.contains("web-fetch-2025-09-10"), "beta='{beta}'");
+		assert!(beta.contains("extended-cache-ttl-2025-04-11"), "beta='{beta}'");
+	}
+
+	#[test]
+	fn test_beta_header_oauth_with_1h_cache() {
+		let chat_req = ChatRequest::new(vec![
+			ChatMessage::user("hello").with_options(CacheControl::Ephemeral1h),
+		]);
+		let req = AnthropicAdapter::to_web_request_data(
+			build_target("sk-ant-oat01-test"),
+			ServiceType::Chat,
+			chat_req,
+			ChatOptionsSet::default(),
+		)
+		.expect("request build");
+		let beta = beta_header(&req);
+		assert!(beta.contains("oauth-2025-04-20"), "beta='{beta}'");
+		assert!(beta.contains("extended-cache-ttl-2025-04-11"), "beta='{beta}'");
+	}
+
+	#[test]
+	fn test_beta_header_oauth_without_1h_cache() {
+		let chat_req = ChatRequest::new(vec![ChatMessage::user("hello")]);
+		let req = AnthropicAdapter::to_web_request_data(
+			build_target("sk-ant-oat01-test"),
+			ServiceType::Chat,
+			chat_req,
+			ChatOptionsSet::default(),
+		)
+		.expect("request build");
+		let beta = beta_header(&req);
+		assert!(beta.contains("oauth-2025-04-20"), "beta='{beta}'");
+		assert!(!beta.contains("extended-cache-ttl-2025-04-11"), "beta='{beta}'");
+	}
+
+	#[test]
+	fn test_beta_header_5m_cache_does_not_trigger_extended_ttl() {
+		let chat_req = ChatRequest::new(vec![
+			ChatMessage::user("hello").with_options(CacheControl::Ephemeral5m),
+			ChatMessage::user("more").with_options(CacheControl::Ephemeral),
+		]);
+		let req = AnthropicAdapter::to_web_request_data(
+			build_target("sk-ant-api-test"),
+			ServiceType::Chat,
+			chat_req,
+			ChatOptionsSet::default(),
+		)
+		.expect("request build");
+		let beta = beta_header(&req);
+		assert!(!beta.contains("extended-cache-ttl-2025-04-11"), "beta='{beta}'");
+	}
+
+	// endregion: --- anthropic-beta header construction tests
 }
 
 // endregion: --- Tests
