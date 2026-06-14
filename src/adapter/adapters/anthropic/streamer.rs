@@ -1,4 +1,5 @@
 use crate::adapter::adapters::support::{StreamerCapturedData, StreamerOptions};
+use crate::adapter::anthropic::oauth_utils::{OAUTH_TOOL_PREFIX, strip_tool_prefix};
 use crate::adapter::anthropic::parse_cache_creation_details;
 use crate::adapter::inter_stream::{InterStreamEnd, InterStreamEvent};
 use crate::chat::{ChatOptionsSet, PromptTokensDetails, StopReason, ToolCall, Usage};
@@ -81,7 +82,11 @@ impl futures::Stream for AnthropicStreamer {
 								Ok("thinking") => self.in_progress_block = InProgressBlock::Thinking,
 								Ok("tool_use") => {
 									let id: String = data.x_take("/content_block/id")?;
-									let name: String = data.x_take("/content_block/name")?;
+									let mut name: String = data.x_take("/content_block/name")?;
+									// Strip OAuth proxy_ prefix if present (tool names are prefixed on OAuth requests).
+									if name.starts_with(OAUTH_TOOL_PREFIX) {
+										name = strip_tool_prefix(&name);
+									}
 
 									// Emit an initial ToolCallChunk with name and empty args,
 									// matching OpenAI's incremental streaming behaviour.
@@ -239,7 +244,20 @@ impl futures::Stream for AnthropicStreamer {
 						}
 
 						"ping" => continue, // Loop to the next event
-						other => tracing::warn!("UNKNOWN MESSAGE TYPE: {other}"),
+						"error" => {
+							// Anthropic may emit an `event: error` mid-stream (e.g. overloaded_error,
+							// rate_limit, internal_server_error). Propagate it as a typed error so the
+							// caller can surface the real cause instead of silently ending the stream.
+							tracing::warn!("Anthropic stream error event, data: {}", message.data);
+							let body: Value =
+								serde_json::from_str(&message.data).unwrap_or_else(|_| Value::String(message.data.clone()));
+							self.done = true;
+							return Poll::Ready(Some(Err(Error::ChatResponse {
+								model_iden: self.options.model_iden.clone(),
+								body,
+							})));
+						}
+						other => tracing::warn!("UNKNOWN MESSAGE TYPE: {other}, data: {}", message.data),
 					}
 				}
 				Some(Err(err)) => {

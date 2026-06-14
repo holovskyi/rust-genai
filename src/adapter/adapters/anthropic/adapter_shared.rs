@@ -1,6 +1,8 @@
 use crate::Result;
 use crate::adapter::adapters::support::get_api_key;
 use crate::adapter::anthropic::AnthropicAdapter;
+use crate::adapter::anthropic::oauth_transform::{OAuthRequestTransformer, OAuthResponseTransformer};
+use crate::adapter::anthropic::oauth_utils::{OAUTH_ANTHROPIC_BETA, is_oauth_token};
 use crate::adapter::{Adapter, AdapterKind, ServiceType, WebRequestData};
 use crate::chat::{
 	Binary, BinarySource, CacheControl, CacheCreationDetails, ChatOptionsSet, ChatRequest, ChatResponse,
@@ -17,6 +19,9 @@ use tracing::warn;
 use value_ext::JsonValueExt;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+// Beta flag to opt into the 1h prompt-cache TTL (5m and default Ephemeral are GA).
+const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 
 // NOTE: For Anthropic, the max_tokens must be specified.
 //       To avoid surprises, the default value for genai is the maximum for a given model.
@@ -365,17 +370,43 @@ impl AnthropicAdapter {
 		chat_req: ChatRequest,
 		options_set: ChatOptionsSet<'_, '_>,
 	) -> Result<WebRequestData> {
+		// -- Detect OAuth mode and get config (before `auth` is moved into get_api_key)
+		let is_oauth = auth.is_oauth() || auth.single_key_value().map(|k| is_oauth_token(&k)).unwrap_or(false);
+		let oauth_config = auth.oauth_credentials().map(|c| c.oauth_config.clone()).unwrap_or_default();
+
 		// -- api_key
 		let api_key = get_api_key(auth, &model)?;
 
 		// -- url
 		let url = Self::get_service_url(&model, service_type, endpoint)?;
 
-		// -- headers
-		let headers = Headers::from(vec![
-			("x-api-key".to_string(), api_key),
-			("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
-		]);
+		// -- Detect any Ephemeral1h cache_control to opt into the extended-cache-ttl beta.
+		//    5m and default Ephemeral are GA and do not require a beta header.
+		let has_1h_cache = chat_req.messages.iter().any(|m| {
+			matches!(
+				m.options.as_ref().and_then(|o| o.cache_control.as_ref()),
+				Some(CacheControl::Ephemeral1h)
+			)
+		});
+
+		// -- headers (OAuth uses a Bearer token + oauth beta, instead of x-api-key)
+		let headers = if is_oauth {
+			let beta_header = if has_1h_cache {
+				format!("{OAUTH_ANTHROPIC_BETA},{EXTENDED_CACHE_TTL_BETA}")
+			} else {
+				OAUTH_ANTHROPIC_BETA.to_string()
+			};
+			Headers::from(vec![
+				("Authorization".to_string(), format!("Bearer {api_key}")),
+				("anthropic-beta".to_string(), beta_header),
+				("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
+			])
+		} else {
+			Headers::from(vec![
+				("x-api-key".to_string(), api_key),
+				("anthropic-version".to_string(), ANTHROPIC_VERSION.to_string()),
+			])
+		};
 
 		// -- Parts
 		let AnthropicRequestParts {
@@ -483,6 +514,9 @@ impl AnthropicAdapter {
 			payload.x_insert("top_p", top_p)?;
 		}
 
+		// -- Apply OAuth request transformations (inject system prompt, prefix tool names, etc.)
+		let payload = OAuthRequestTransformer::transform_with_config(payload, is_oauth, &oauth_config);
+
 		Ok(WebRequestData { url, headers, payload })
 	}
 
@@ -491,6 +525,10 @@ impl AnthropicAdapter {
 		web_response: WebResponse,
 	) -> Result<ChatResponse> {
 		let WebResponse { mut body, .. } = web_response;
+
+		// -- Detect and handle OAuth response (tool names are prefixed with `proxy_`)
+		let is_oauth = OAuthResponseTransformer::detect_oauth_response(&body);
+		body = OAuthResponseTransformer::transform(body, is_oauth);
 
 		// -- Capture the provider_model_iden
 		// TODO: Need to be implemented (if available), for now, just clone model_iden

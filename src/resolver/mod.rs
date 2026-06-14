@@ -10,6 +10,9 @@ mod auth_resolver;
 mod endpoint;
 mod error;
 mod model_mapper;
+mod oauth_config;
+mod oauth_credentials;
+mod oauth_refresh;
 mod provider_config;
 mod service_target_resolver;
 
@@ -18,6 +21,9 @@ pub use auth_resolver::*;
 pub use endpoint::*;
 pub use error::{Error, Result};
 pub use model_mapper::*;
+pub use oauth_config::*;
+pub use oauth_credentials::*;
+pub use oauth_refresh::*;
 pub use provider_config::*;
 pub use service_target_resolver::*;
 

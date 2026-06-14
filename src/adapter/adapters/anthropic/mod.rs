@@ -8,10 +8,15 @@
 
 mod adapter_impl;
 mod adapter_shared;
+pub mod oauth_config;
+pub mod oauth_obfuscate;
+pub mod oauth_transform;
+pub mod oauth_utils;
 mod streamer;
 
 pub use adapter_impl::*;
 pub(in crate::adapter::adapters) use adapter_shared::*;
 pub use streamer::*;
+// OAuthConfig re-exported at crate::adapter level
 
 // endregion: --- Modules
