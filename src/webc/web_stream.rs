@@ -24,6 +24,11 @@ pub struct WebStream {
 	partial_message: Option<String>,
 	// If a poll retrieved multiple messages, we keep them to be sent in the next poll
 	remaining_messages: Option<VecDeque<String>>,
+	// Raw bytes left over when an HTTP chunk ends mid-UTF-8-character. They are
+	// prepended to the next chunk before decoding. This sits *below* the
+	// `partial_message` delimiter buffering: it fixes byte-boundary splits, while
+	// `partial_message` carries an incomplete delimited message.
+	partial_bytes: Vec<u8>,
 }
 
 pub enum StreamMode {
@@ -42,6 +47,7 @@ impl WebStream {
 			bytes_stream: None,
 			partial_message: None,
 			remaining_messages: None,
+			partial_bytes: Vec::new(),
 		}
 	}
 
@@ -53,6 +59,7 @@ impl WebStream {
 			bytes_stream: None,
 			partial_message: None,
 			remaining_messages: None,
+			partial_bytes: Vec::new(),
 		}
 	}
 }
@@ -110,10 +117,18 @@ impl Stream for WebStream {
 			if let Some(ref mut stream) = this.bytes_stream {
 				match stream.as_mut().poll_next(cx) {
 					Poll::Ready(Some(Ok(bytes))) => {
-						let buff_string = match String::from_utf8(bytes.to_vec()) {
+						// Decode the chunk, carrying any trailing bytes of a UTF-8
+						// character that an HTTP/TLS chunk boundary split in half.
+						let buff_string = match decode_chunk(&mut this.partial_bytes, &bytes) {
 							Ok(s) => s,
 							Err(e) => return Poll::Ready(Some(Err(Box::new(e) as BoxError))),
 						};
+
+						// The whole chunk was a single partial character — wait for more
+						// bytes rather than feeding an empty string into the parser.
+						if buff_string.is_empty() {
+							continue;
+						}
 
 						// -- Iterate through the parts
 						let buff_response = match this.stream_mode {
@@ -154,6 +169,15 @@ impl Stream for WebStream {
 					}
 					Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
 					Poll::Ready(None) => {
+						// A well-formed stream ends on a complete character; leftover
+						// bytes here mean the response was truncated mid-character.
+						if !this.partial_bytes.is_empty() {
+							tracing::debug!(
+								"GENAI - WebStream ended with {} undecoded trailing byte(s)",
+								this.partial_bytes.len()
+							);
+							this.partial_bytes.clear();
+						}
 						if let Some(partial) = this.partial_message.take()
 							&& !partial.is_empty()
 						{
@@ -173,6 +197,52 @@ impl Stream for WebStream {
 
 			return Poll::Ready(None);
 		}
+	}
+}
+
+/// Decode one raw HTTP chunk into UTF-8, carrying a character that a chunk
+/// boundary split across `partial_bytes`.
+///
+/// - Any bytes left over from the previous call are prepended.
+/// - A complete buffer decodes fully and leaves `partial_bytes` empty.
+/// - A buffer ending mid-character returns the valid prefix and stashes the
+///   incomplete tail in `partial_bytes` for the next call (may return `""`).
+/// - Genuinely invalid bytes (not just a truncated tail) return `Err`.
+fn decode_chunk(partial_bytes: &mut Vec<u8>, bytes: &[u8]) -> Result<String, std::str::Utf8Error> {
+	// Fast path: nothing carried over — decode in place without an extra alloc.
+	if partial_bytes.is_empty() {
+		return match std::str::from_utf8(bytes) {
+			Ok(s) => Ok(s.to_string()),
+			Err(e) => match e.error_len() {
+				None => {
+					let valid = e.valid_up_to();
+					*partial_bytes = bytes[valid..].to_vec();
+					// `valid_up_to()` guarantees this prefix is valid UTF-8.
+					Ok(std::str::from_utf8(&bytes[..valid])
+						.expect("valid_up_to bytes are valid UTF-8")
+						.to_string())
+				}
+				Some(_) => Err(e),
+			},
+		};
+	}
+
+	let mut buf = std::mem::take(partial_bytes);
+	buf.extend_from_slice(bytes);
+	match std::str::from_utf8(&buf) {
+		Ok(s) => Ok(s.to_string()),
+		Err(e) => match e.error_len() {
+			None => {
+				let valid = e.valid_up_to();
+				// `valid_up_to()` guarantees this prefix is valid UTF-8.
+				let s = std::str::from_utf8(&buf[..valid])
+					.expect("valid_up_to bytes are valid UTF-8")
+					.to_string();
+				*partial_bytes = buf[valid..].to_vec();
+				Ok(s)
+			}
+			Some(_) => Err(e),
+		},
 	}
 }
 
@@ -338,4 +408,55 @@ fn process_buff_string_delimited(
 		next_messages,
 		candidate_message,
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::decode_chunk;
+
+	/// A 2-byte Cyrillic char (U+0444 "ф" = 0xD1 0x84) split across two chunks
+	/// must not error — the valid prefix decodes and the tail carries over.
+	#[test]
+	fn carries_split_two_byte_char() {
+		let full = "аф".as_bytes(); // U+0430 (2B) + U+0444 (2B)
+		let split = full.len() - 1; // break inside the last char
+		let mut partial = Vec::new();
+
+		let first = decode_chunk(&mut partial, &full[..split]).unwrap();
+		assert_eq!(first, "а");
+		assert_eq!(partial.len(), 1); // one trailing byte held back
+
+		let second = decode_chunk(&mut partial, &full[split..]).unwrap();
+		assert_eq!(second, "ф");
+		assert!(partial.is_empty());
+	}
+
+	/// A 4-byte emoji (U+1F600) split one byte at a time still reassembles.
+	#[test]
+	fn carries_split_four_byte_char_byte_by_byte() {
+		let emoji = "😀".as_bytes();
+		assert_eq!(emoji.len(), 4);
+		let mut partial = Vec::new();
+		let mut out = String::new();
+		for b in emoji {
+			out.push_str(&decode_chunk(&mut partial, &[*b]).unwrap());
+		}
+		assert_eq!(out, "😀");
+		assert!(partial.is_empty());
+	}
+
+	/// Whole, valid chunk with an empty carry takes the fast path unchanged.
+	#[test]
+	fn whole_chunk_fast_path() {
+		let mut partial = Vec::new();
+		assert_eq!(decode_chunk(&mut partial, b"hello").unwrap(), "hello");
+		assert!(partial.is_empty());
+	}
+
+	/// Genuinely invalid bytes (0xFF) are surfaced as an error, not buffered.
+	#[test]
+	fn rejects_invalid_bytes() {
+		let mut partial = Vec::new();
+		assert!(decode_chunk(&mut partial, &[0x68, 0xFF, 0x69]).is_err());
+	}
 }
