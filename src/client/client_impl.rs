@@ -83,18 +83,36 @@ impl Client {
 			headers = override_headers;
 		};
 
-		let web_res =
-			self.web_client()
-				.do_post(&url, &headers, payload)
-				.await
-				.map_err(|webc_error| Error::WebModelCall {
-					model_iden: model.clone(),
-					webc_error,
-				})?;
+		let web_res = self
+			.web_client()
+			.do_post(&url, &headers, &payload)
+			.await
+			.map_err(|webc_error| Error::WebModelCall {
+				model_iden: model.clone(),
+				webc_error,
+			})?;
 
-		let chat_res = AdapterDispatcher::to_chat_response(model, web_res, options_set)?;
+		// Note: here we capture/clone the raw body if set in the options_set
+		let captured_raw_body = options_set.capture_raw_body().unwrap_or_default().then(|| web_res.body.clone());
 
-		Ok(chat_res)
+		match AdapterDispatcher::to_chat_response(model.clone(), web_res, options_set) {
+			Ok(mut chat_res) => {
+				chat_res.captured_raw_body = captured_raw_body;
+				Ok(chat_res)
+			}
+			Err(err) => {
+				let response_body = captured_raw_body.unwrap_or_else(|| {
+					"Raw response not captured. Use the ChatOptions.capturre_raw_body flag to see raw response in this error".into()
+				});
+				let err = Error::ChatResponseGeneration {
+					model_iden: model,
+					request_payload: Box::new(payload),
+					response_body: Box::new(response_body),
+					cause: err.to_string(),
+				};
+				Err(err)
+			}
+		}
 	}
 
 	/// Streams a chat response.
@@ -137,7 +155,7 @@ impl Client {
 
 		let reqwest_builder = self
 			.web_client()
-			.new_req_builder(&url, &headers, payload)
+			.new_req_builder(&url, &headers, &payload)
 			.map_err(|webc_error| Error::WebModelCall {
 				model_iden: model.clone(),
 				webc_error,
@@ -188,14 +206,14 @@ impl Client {
 		let WebRequestData { headers, payload, url } =
 			AdapterDispatcher::to_embed_request_data(target, embed_req, options_set.clone())?;
 
-		let web_res =
-			self.web_client()
-				.do_post(&url, &headers, payload)
-				.await
-				.map_err(|webc_error| Error::WebModelCall {
-					model_iden: model.clone(),
-					webc_error,
-				})?;
+		let web_res = self
+			.web_client()
+			.do_post(&url, &headers, &payload)
+			.await
+			.map_err(|webc_error| Error::WebModelCall {
+				model_iden: model.clone(),
+				webc_error,
+			})?;
 
 		let res = AdapterDispatcher::to_embed_response(model, web_res, options_set)?;
 
