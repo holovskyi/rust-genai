@@ -224,11 +224,14 @@ git push origin --delete fix/descriptive-name
 
 ## Using in Projects
 
-### Via Branch (recommended)
+### Via Tag (recommended)
+
+Pin a **tag**, not a branch — tags are immutable, so the build is reproducible and
+`cargo` caching stays predictable. A branch rev moves under you; a tag never does.
 
 ```toml
 [dependencies]
-genai = { git = "https://github.com/holovskyi/rust-genai", branch = "eckermann" }
+genai = { git = "https://github.com/holovskyi/rust-genai", tag = "v0.6.5-eckermann.1" }
 ```
 
 ### Via Local Path (for development)
@@ -237,6 +240,52 @@ genai = { git = "https://github.com/holovskyi/rust-genai", branch = "eckermann" 
 [dependencies]
 genai = { path = "../rust-genai" }
 ```
+
+## Releasing & Tagging
+
+**Tags are append-only. Never move a tag.** Each released change gets a new tag; the
+consumer bumps one line to adopt it (and reverts that one line to roll back).
+
+### Versioning scheme
+
+`v<upstream>-eckermann.<N>`:
+
+| Tag | Meaning |
+|-----|---------|
+| `v0.6.5-eckermann.1` | upstream 0.6.5, our iteration #1 |
+| `v0.6.5-eckermann.2` | same upstream 0.6.5, our next change (OAuth fix, etc.) |
+| `v0.6.6-eckermann.1` | pulled upstream 0.6.6, our iteration #1 |
+| `v0.7.0-eckermann.1` | migrated to 0.7 |
+
+Rule: **our code changes on the same base → bump `.N`**; **new upstream base → change
+`<upstream>` and reset `.N` to 1**.
+
+### Cutting a release
+
+```bash
+# 1. Commit changes on the working branch (e.g. eckermann-0.6)
+git add -A && git commit -m "fix(oauth): ..."
+git push origin eckermann-0.6
+
+# 2. New immutable tag (increment the suffix)
+git tag -a v0.6.5-eckermann.2 -m "describe the change"
+git push origin v0.6.5-eckermann.2
+
+# 3. In the consumer (e.g. Eckermann.ink/backend): bump the one line
+#    Cargo.toml:  tag = "v0.6.5-eckermann.2"
+cargo update -p genai
+cargo check --locked
+```
+
+### Why never move a tag
+
+- `cargo` caches git deps by tag; a moved tag can silently build stale code or pull new
+  code unexpectedly.
+- A moved tag breaks reproducibility — the same `Cargo.lock` would point at different code.
+- Rollback is trivial when tags are stable: put the previous tag back in `Cargo.toml`.
+
+> Renaming branches (e.g. promoting `eckermann-0.6` → `eckermann`) does **not** affect
+> consumers, because they pin a tag, and tags don't move when branches are renamed.
 
 ## Quick Reference
 
