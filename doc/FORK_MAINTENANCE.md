@@ -266,3 +266,53 @@ cargo check
 git push origin fix/some-bug
 gh pr create --repo jeremychone/rust-genai ...
 ```
+
+## Upstream Maintainer Preferences (from PR feedback)
+
+Lessons learned from contributing to `jeremychone/rust-genai`. Follow these to
+maximize the chance a PR is accepted.
+
+1. **Separate fixes from API changes — one concern per PR.**
+   Bug fixes can be applied to the *current* release line (e.g. `0.5.x`), while
+   API changes are batched into the next major (e.g. `0.6.x`, which takes longer
+   because the maintainer combines several API changes into one release). Mixing
+   both in a single PR forces the whole thing to wait for the major release.
+   > "It's good to separate fixes vs. API changes so that I can apply the changes
+   > to the current release, while API changes come after."
+
+2. **Avoid provider-specific types and variant proliferation.**
+   The maintainer dislikes adding many Anthropic-specific types/enum variants.
+   Designs that *normalize* behavior across providers (Anthropic, OpenAI, Gemini)
+   are strongly preferred. Before proposing typed variants, check how the same
+   feature would map onto the other providers.
+   > "There are so many types and variants specific to Anthropic... If we start
+   > having variants and types per provider category, this will explode."
+   The generic escape hatch the maintainer favors: `Custom` variants on
+   `ToolName`, `ToolConfig`, and `ContentPart` so callers can pass/read data the
+   library doesn't explicitly type.
+
+3. **A good idea may be reimplemented rather than merged.**
+   Even a closed PR can shape upstream. Our web-tools PR (#133) was closed but the
+   maintainer re-implemented it "in a different, more generic way," explicitly
+   "strongly inspired by" it. Expect influence, not necessarily your code.
+
+### Our PR track record
+
+| PR | Topic | Outcome | Notes |
+|----|-------|---------|-------|
+| #130 | prompt caching fixes | **Merged** | Released in `0.6.0-alpha.1`. Our code. Maintainer later extended TTL (`Ephemeral1h/24h`) himself. |
+| #133 | web search + web fetch | Closed | Reimplemented generically upstream (`ToolName::WebSearch` + `WebSearchConfig` + `Custom`). Our idea, not our code — so the 0.6 API shape differs from our fork. |
+| #134 | tool hijacking + streamer state | Closed | Solved independently via the `ToolName` redesign. |
+| #245 | mid-stream `error` event | Open | Pure fix, no API change, no OAuth — the kind of PR the maintainer can take into the current line. |
+
+Note: our UTF-8 chunk-boundary fix (`utf8_carry`) was **never** submitted as a PR;
+upstream implemented the same thing independently. It already exists in
+`upstream/main`, so do not open a PR for it.
+
+### Implication for our OAuth patches
+
+Our Anthropic OAuth support (`sk-ant-oat` tokens + auto-refresh + request/response
+transform + obfuscation) is Claude-Code-CLI-specific and provider-specific by
+nature, so it is unlikely to be accepted upstream given preference #2. Treat it as
+a **permanent fork delta** to carry across upstream updates, not as something to
+upstream.
